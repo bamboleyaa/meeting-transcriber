@@ -926,25 +926,23 @@ extension PipelineQueue {
     // MARK: - Protocol generation
 
     /// Run the LLM protocol generator over a transcript, save the .md file,
-    /// stash its path on the job. No-op if no protocol generator is configured.
-    /// Used by: main pipeline (if no naming pending) and the session's
-    /// reapplySpeakerNames / skipped / stale paths. Internal (not private)
-    /// because it is a `SpeakerNamingSessionDelegate` witness.
+    /// stash its path on the job. When no protocol will be produced — no
+    /// generator configured, or generation threw — the raw transcript goes to
+    /// the webhook instead, so the meeting still leaves the Mac. Used by: main
+    /// pipeline (if no naming pending) and the session's reapplySpeakerNames /
+    /// skipped / stale paths. Internal (not private) because it is a
+    /// `SpeakerNamingSessionDelegate` witness.
     func generateProtocol(
         jobID: UUID, transcript: String, title: String, protocolsDir: URL,
     ) async {
+        let shortID = PipelineJob.shortID(for: jobID)
+        let (jobInfo, initialBasename, meetingStartTime) = webhookJobInfo(jobID: jobID, title: title)
         guard let protocolGeneratorFactory, let generator = protocolGeneratorFactory() else {
+            // No provider: nothing will produce a protocol, so hand the
+            // transcript over and let the receiver build one.
+            deliverTranscript(jobInfo, basename: initialBasename, transcript: transcript)
             return
         }
-        let shortID = PipelineJob.shortID(for: jobID)
-        // Reuse the basename fixed when the transcript was saved (persisted as
-        // namingSlug), so the .md shares the .txt/audio stem exactly. This runs
-        // only after a transcript exists, so namingSlug is set on every real
-        // path; the fallback just keeps generation working if the job is gone.
-        let job = jobs.first { $0.id == jobID }
-        let initialBasename = job?.namingSlug
-            ?? Self.namingSlug(title: title, jobID: jobID, startTime: Date())
-        let meetingStartTime = job?.meetingStartTime
         updateJobState(id: jobID, to: .generatingProtocol)
         let protocolMD: String
         do {
@@ -969,6 +967,9 @@ extension PipelineQueue {
             // restores the visibility traded away in PR #692's 4th commit.
             logger.warning("[\(shortID, privacy: .public)] protocol_generation_failed error=\(error.localizedDescription, privacy: .public)")
             addWarning(id: jobID, "Protocol generation failed — transcript saved")
+            // The protocol is gone for good, but the transcript is not: send
+            // it so the meeting still reaches the receiver.
+            deliverTranscript(jobInfo, basename: initialBasename, transcript: transcript)
             return
         }
 
@@ -998,22 +999,51 @@ extension PipelineQueue {
             // confirm/skip, late rerun, resume), so this is the one place the
             // webhook needs. Same job id on a regeneration → same
             // Idempotency-Key, and the receiver keeps the first delivery.
-            ProtocolWebhook.deliverIfConfigured(
-                job: .init(
-                    jobID: jobID,
-                    title: job?.meetingTitle ?? title,
-                    appName: job?.appName ?? "",
-                    meetingStartTime: meetingStartTime,
-                    participants: job?.participants ?? [],
-                    participantEmails: job?.participantEmails ?? [],
-                ),
-                protocolPath: mdPath,
-            ) { [weak self] message in self?.addWarning(id: jobID, message) }
+            webhook.protocolReady(job: jobInfo, protocolPath: mdPath) { [weak self] message in
+                self?.addWarning(id: jobID, message)
+            }
         } catch {
             // Private, unlike the generation failure above: a file-write
             // CocoaError names the file, and the file name is the meeting title.
             logger.warning("[\(shortID, privacy: .public)] protocol_save_failed error=\(error.localizedDescription, privacy: .private)")
             addWarning(id: jobID, "Protocol was generated but could not be saved; the transcript was saved")
+        }
+    }
+
+    /// What both webhook events need to describe a job, plus the artifact
+    /// basename the protocol would have used: fixed when the transcript was
+    /// saved (persisted as `namingSlug`), so the `.md` shares the `.txt`/audio
+    /// stem exactly. Only called once a transcript exists, so `namingSlug` is
+    /// set on every real path; the fallback keeps generation working if the job
+    /// is gone.
+    private func webhookJobInfo(
+        jobID: UUID, title: String,
+    ) -> (info: ProtocolWebhook.JobInfo, basename: String, meetingStart: Date?) {
+        let job = jobs.first { $0.id == jobID }
+        let info = ProtocolWebhook.JobInfo(
+            jobID: jobID,
+            title: job?.meetingTitle ?? title,
+            appName: job?.appName ?? "",
+            meetingStartTime: job?.meetingStartTime,
+            participants: job?.participants ?? [],
+            participantEmails: job?.participantEmails ?? [],
+        )
+        let basename = job?.namingSlug
+            ?? Self.namingSlug(title: title, jobID: jobID, startTime: Date())
+        return (info, basename, job?.meetingStartTime)
+    }
+
+    /// Hand the raw transcript to the webhook, under the name the `.txt`
+    /// actually has on disk (a late AI-title rename changes the stem, and the
+    /// receiver's copy should match the file the protocol would have come
+    /// from). `basename` is the documented fallback for a job that is gone.
+    private func deliverTranscript(
+        _ job: ProtocolWebhook.JobInfo, basename: String, transcript: String,
+    ) {
+        let filename = jobs.first { $0.id == job.jobID }?.transcriptPath?.lastPathComponent
+            ?? "\(basename).txt"
+        webhook.transcriptReady(job: job, transcriptFilename: filename, transcript: transcript) { [weak self] message in
+            self?.addWarning(id: job.jobID, message)
         }
     }
 

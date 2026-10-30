@@ -29,6 +29,9 @@ enum ProtocolWebhook {
     /// two bytes) and the other fields.
     static let maxMarkdownBytes = 200 * 1024
     static let maxBodyBytes = 256 * 1024
+    /// The same margin for the transcript event, whose whole payload is the
+    /// transcript: Multica caps the body at 256 KiB and answers 413.
+    static let maxTranscriptBytes = 200 * 1024
 
     static let fullTranscriptMarker = "\n\n---\n\n## Full Transcript\n\n"
 
@@ -79,11 +82,15 @@ enum ProtocolWebhook {
         return url
     }
 
+    /// ISO 8601 with the local offset, or nil for a meeting whose start the
+    /// app never learned. Shared by both events so a receiver parses one shape.
+    static func isoString(_ date: Date?) -> String? {
+        date.map { ISO8601DateFormatter.string(from: $0, timeZone: .current, formatOptions: [.withInternetDateTime]) }
+    }
+
     static func makePayload(job: JobInfo, markdown: String, protocolFilename: String) -> Payload {
         let (body, truncated) = fit(markdown, limit: maxMarkdownBytes)
-        let start = job.meetingStartTime.map { date in
-            ISO8601DateFormatter.string(from: date, timeZone: .current, formatOptions: [.withInternetDateTime])
-        }
+        let start = isoString(job.meetingStartTime)
         return Payload(
             jobID: job.jobID.uuidString,
             title: job.title,
@@ -119,16 +126,21 @@ enum ProtocolWebhook {
         return (text, true)
     }
 
-    static func makeRequest(url: URL, payload: Payload) throws -> URLRequest {
+    static func makeRequest(url: URL, body: Body) throws -> URLRequest {
         var request = URLRequest(url: url, timeoutInterval: 30)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue(payload.jobID, forHTTPHeaderField: "Idempotency-Key")
+        request.setValue(body.idempotencyKey, forHTTPHeaderField: "Idempotency-Key")
         request.setValue("MeetingTranscriber/\(Bundle.main.appVersion)", forHTTPHeaderField: "User-Agent")
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        request.httpBody = try encoder.encode(payload)
+        request.httpBody = try encoder.encode(body)
         return request
+    }
+
+    /// Convenience for the protocol event, the body that existed first.
+    static func makeRequest(url: URL, payload: Payload) throws -> URLRequest {
+        try makeRequest(url: url, body: .protocolReady(payload))
     }
 
     enum Outcome: Equatable {
@@ -181,7 +193,7 @@ enum ProtocolWebhook {
     /// delivery proves the receiver is reachable again, so whatever waited in
     /// the outbox goes next; what that flush gave up on goes to `notify`.
     static func deliver(
-        _ payload: Payload,
+        _ body: Body,
         to url: URL,
         outbox: ProtocolWebhookOutbox,
         session: URLSession = .shared,
@@ -192,7 +204,7 @@ enum ProtocolWebhook {
         let outcome: Outcome
         do {
             outcome = try await send(
-                makeRequest(url: url, payload: payload), session: session, retryDelays: retryDelays, sleep: sleep,
+                makeRequest(url: url, body: body), session: session, retryDelays: retryDelays, sleep: sleep,
             )
         } catch {
             // Encoding a plain struct of strings does not fail in practice;
@@ -201,17 +213,33 @@ enum ProtocolWebhook {
         }
         switch outcome {
         case .delivered:
-            await outbox.remove(jobID: payload.jobID)
+            await outbox.remove(jobID: body.jobID)
             let report = await outbox.flush(url: url, session: session)
             if let message = ProtocolWebhookOutbox.notice(for: report) { notify(message) }
 
         case .rejected:
-            await outbox.remove(jobID: payload.jobID)
+            await outbox.remove(jobID: body.jobID)
 
         case .failed:
-            await outbox.save(payload)
+            await outbox.save(body)
         }
         return outcome
+    }
+
+    /// Convenience for the protocol event; see `deliver(_:to:outbox:...)`.
+    static func deliver(
+        _ payload: Payload,
+        to url: URL,
+        outbox: ProtocolWebhookOutbox,
+        session: URLSession = .shared,
+        retryDelays: [Duration] = defaultRetryDelays,
+        sleep: (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
+        notify: @Sendable (String) -> Void = { _ in },
+    ) async -> Outcome {
+        await deliver(
+            .protocolReady(payload), to: url, outbox: outbox, session: session,
+            retryDelays: retryDelays, sleep: sleep, notify: notify,
+        )
     }
 
     /// Fire-and-forget entry point for the pipeline. `warn` runs on the main

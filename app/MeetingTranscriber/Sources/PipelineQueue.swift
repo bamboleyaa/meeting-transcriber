@@ -67,6 +67,9 @@ class PipelineQueue {
     /// (current global setting). Production wires both via `AppState`.
     let diarizationFactoryWithMode: ((DiarizerMode) -> any DiarizationProvider)?
     let protocolGeneratorFactory: (() -> (any ProtocolGenerating)?)?
+    /// Where finished meetings leave the Mac. Injectable so a test can say
+    /// "the transcript went out, the protocol did not" without a Keychain URL.
+    let webhook: any WebhookDispatching
     let outputDir: URL?
     /// Opens and closes security-scoped access on `outputDir`. Injectable so a
     /// test can record where and when the scope is held; see `SecurityScopeAccess`.
@@ -292,6 +295,7 @@ class PipelineQueue {
         inFlightRuns: InFlightRunRegistry? = nil,
         echoCancellationEnabled: @escaping () -> Bool = { false },
         echoCancellerFactory: (() -> (any EchoCancelling)?)? = nil,
+        webhook: any WebhookDispatching = LiveWebhookDispatch(),
     ) {
         self.logDir = logDir ?? AppPaths.ipcDir
         self.processedLedger = ProcessedRecordingsLedger(logDir: self.logDir)
@@ -300,6 +304,7 @@ class PipelineQueue {
         self.diarizationFactory = nil
         self.diarizationFactoryWithMode = nil
         self.protocolGeneratorFactory = nil
+        self.webhook = webhook
         self.outputDir = nil
         securityScope = .live
         scopedOutputDir = nil
@@ -411,6 +416,7 @@ class PipelineQueue {
         terminalJobStore: TerminalJobStore? = nil,
         inFlightRuns: InFlightRunRegistry? = nil,
         securityScope: SecurityScopeAccess = .live,
+        webhook: any WebhookDispatching = LiveWebhookDispatch(),
     ) {
         self.logDir = logDir ?? AppPaths.ipcDir
         self.processedLedger = ProcessedRecordingsLedger(logDir: self.logDir)
@@ -419,6 +425,7 @@ class PipelineQueue {
         self.diarizationFactory = diarizationFactory
         self.diarizationFactoryWithMode = diarizationFactoryWithMode
         self.protocolGeneratorFactory = protocolGeneratorFactory
+        self.webhook = webhook
         self.outputDir = outputDir
         self.securityScope = securityScope
         scopedOutputDir = securityScope.start(outputDir) ? outputDir : nil

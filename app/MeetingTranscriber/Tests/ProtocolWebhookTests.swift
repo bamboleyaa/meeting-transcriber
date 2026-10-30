@@ -123,6 +123,106 @@ final class ProtocolWebhookTests: XCTestCase { // swiftlint:disable:this balance
         XCTAssertEqual(ProtocolWebhook.fit("ok", limit: 7).0, "ok")
     }
 
+    // MARK: - Transcript payload
+
+    private func transcriptRequest(
+        _ transcript: String,
+        filename: String = "20261030_1200_standup.txt",
+    ) throws -> URLRequest {
+        let payload = ProtocolWebhook.makeTranscriptPayload(
+            job: job, transcript: transcript, transcriptFilename: filename,
+        )
+        return try ProtocolWebhook.makeRequest(
+            url: XCTUnwrap(URL(string: "https://h/x")), body: .transcriptReady(payload),
+        )
+    }
+
+    func testTranscriptPayloadHasTheAgreedShape() throws {
+        let request = try transcriptRequest("[00:00] Anna: hello")
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
+        XCTAssertEqual(
+            request.value(forHTTPHeaderField: "Idempotency-Key"), "transcript-\(job.jobID.uuidString)",
+        )
+
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(request.httpBody)) as? [String: Any])
+        XCTAssertEqual(Set(json.keys), [
+            "event", "version", "job_id", "title", "app", "meeting_start",
+            "participants", "transcript_filename", "transcript", "truncated",
+        ])
+        XCTAssertEqual(json["event"] as? String, "transcript.ready")
+        XCTAssertEqual(json["version"] as? Int, 1)
+        XCTAssertEqual(json["job_id"] as? String, job.jobID.uuidString)
+        XCTAssertEqual(json["title"] as? String, "Weekly sync")
+        XCTAssertEqual(json["app"] as? String, "Microsoft Teams")
+        XCTAssertEqual(json["participants"] as? [String], ["Anna", "Boris"])
+        XCTAssertEqual(json["transcript_filename"] as? String, "20261030_1200_standup.txt")
+        XCTAssertEqual(json["transcript"] as? String, "[00:00] Anna: hello")
+        XCTAssertEqual(json["truncated"] as? Bool, false)
+        XCTAssertNotNil(json["meeting_start"] as? String)
+    }
+
+    func testTranscriptPayloadCarriesParticipantEmailsWhenKnown() throws {
+        var withEmails = job
+        withEmails.participantEmails = ["anna@example.com"]
+        let payload = ProtocolWebhook.makeTranscriptPayload(
+            job: withEmails, transcript: "ok", transcriptFilename: "a.txt",
+        )
+        let request = try ProtocolWebhook.makeRequest(url: XCTUnwrap(URL(string: "https://h/x")), body: .transcriptReady(payload))
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(request.httpBody)) as? [String: Any])
+        XCTAssertEqual(json["participant_emails"] as? [String], ["anna@example.com"])
+    }
+
+    func testTranscriptPayloadLeavesParticipantEmailsOutWhenUnknown() throws {
+        let request = try transcriptRequest("ok")
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(request.httpBody)) as? [String: Any])
+        XCTAssertNil(json["participant_emails"])
+    }
+
+    func testLongTranscriptIsTruncatedToTheLimitKeepingTheEnd() {
+        let transcript = "НАЧАЛО ВСТРЕЧИ\n" + String(repeating: "я", count: 300_000) + "\nКОНЕЦ"
+        let (text, truncated) = ProtocolWebhook.truncateTranscript(transcript)
+
+        XCTAssertTrue(truncated)
+        XCTAssertLessThanOrEqual(text.utf8.count, ProtocolWebhook.maxTranscriptBytes)
+        XCTAssertTrue(text.hasSuffix("КОНЕЦ"), "the end of the meeting is what a protocol is made from")
+        XCTAssertFalse(text.contains("НАЧАЛО"), "the head is what was dropped")
+    }
+
+    func testTruncationCutsOnACharacterBoundary() {
+        let (text, truncated) = ProtocolWebhook.truncateTranscript("яяя", limit: 5)
+
+        XCTAssertTrue(truncated)
+        XCTAssertEqual(text, "яя", "two bytes per character: a half character never lands in the body")
+        XCTAssertEqual(ProtocolWebhook.truncateTranscript("ok", limit: 5).0, "ok")
+    }
+
+    func testTranscriptRequestStaysUnderReceiverBodyCap() throws {
+        // A long Russian meeting with quotes is the realistic worst case for
+        // JSON escaping: every quote and newline takes two bytes.
+        let transcript = String(repeating: "[Анна] Проверим \"квоту\".\n", count: 20000)
+        let request = try transcriptRequest(transcript)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(request.httpBody)) as? [String: Any])
+
+        XCTAssertEqual(json["truncated"] as? Bool, true)
+        XCTAssertLessThanOrEqual(try XCTUnwrap(request.httpBody).count, ProtocolWebhook.maxBodyBytes)
+    }
+
+    func testBodyDecodesBackToTheSameEvent() throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let transcriptBody = ProtocolWebhook.makeTranscriptPayload(
+            job: job, transcript: "[00:00] hi", transcriptFilename: "a.txt",
+        )
+        let protocolBody = ProtocolWebhook.makePayload(job: job, markdown: "ok", protocolFilename: "a.md")
+
+        for body in [ProtocolWebhook.Body.transcriptReady(transcriptBody), .protocolReady(protocolBody)] {
+            let decoded = try JSONDecoder().decode(ProtocolWebhook.Body.self, from: encoder.encode(body))
+            XCTAssertEqual(decoded, body)
+            XCTAssertEqual(decoded.jobID, job.jobID.uuidString)
+        }
+    }
+
     // MARK: - Delivery
 
     private func send(_ session: URLSession) async -> ProtocolWebhook.Outcome {

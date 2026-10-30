@@ -201,24 +201,24 @@ final class SpeakerNamingSession {
 
     /// Skipped or stale-cleanup path: the user accepted (implicitly or by
     /// timeout) the auto-names. Drops sidecar files synchronously, transitions
-    /// to .done. If a protocol generator is configured AND the transcript file
-    /// exists, fires off protocol generation in the background; the job
-    /// transitions through .generatingProtocol → .done as that completes.
+    /// to .done. If the transcript file exists, fires off protocol generation
+    /// in the background — or the transcript webhook, when no protocol will be
+    /// produced; the job transitions through .generatingProtocol → .done as
+    /// that completes.
     private func acceptAutoNames(jobID: UUID, slug: String?) {
-        // Probe the factory's actual output, not just its existence — the
-        // closure is wired even when protocolProvider is `.none`, but returns
-        // nil. Without this, the Task path below fizzles silently
-        // (generateProtocol guards on factory()) and the job sits in
-        // .speakerNamingPending forever.
-        let canGenerateProtocol = (protocolGeneratorFactory?() != nil)
-            && delegate?.job(withID: jobID)?.transcriptPath != nil
+        // A transcript is the bar, not a configured generator: when no
+        // protocol will be produced (provider None, or generation failing),
+        // `generateProtocol` sends the transcript to the webhook instead, and
+        // skipping the call would leave the meeting on this Mac forever. The
+        // delegate probe also proves the job's transcript file is known.
+        let hasTranscript = delegate?.job(withID: jobID)?.transcriptPath != nil
 
         removeNamingData(jobID: jobID, slug: slug)
 
-        // `canGenerateProtocol == true` implies the delegate was alive above
-        // (it resolved the job's transcriptPath); binding it here lets the Task
+        // `hasTranscript == true` implies the delegate was alive above (it
+        // resolved the job's transcriptPath); binding it here lets the Task
         // closure hold the queue strongly from spawn (see `delegate`).
-        if canGenerateProtocol, let delegate {
+        if hasTranscript, let delegate {
             Task { await generateProtocolForExistingJob(jobID: jobID, delegate: delegate) }
         } else if delegate?.job(withID: jobID)?.state == .speakerNamingPending {
             delegate?.updateJobState(id: jobID, to: .done)

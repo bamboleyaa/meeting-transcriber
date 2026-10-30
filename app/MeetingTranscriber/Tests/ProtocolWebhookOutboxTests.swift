@@ -45,14 +45,17 @@ final class ProtocolWebhookOutboxTests: XCTestCase {
         return { keys }
     }
 
-    private func payload(_ id: String = UUID().uuidString) -> ProtocolWebhook.Payload {
-        ProtocolWebhook.makePayload(
-            job: .init(
-                jobID: UUID(uuidString: id) ?? UUID(), title: "Weekly sync", appName: "Zoom",
-                meetingStartTime: start, participants: ["Anna"],
-            ),
-            markdown: "## Summary\nok", protocolFilename: "a.md",
+    private func job(_ id: String = UUID().uuidString) -> ProtocolWebhook.JobInfo {
+        .init(
+            jobID: UUID(uuidString: id) ?? UUID(), title: "Weekly sync", appName: "Zoom",
+            meetingStartTime: start, participants: ["Anna"],
         )
+    }
+
+    private func payload(_ id: String = UUID().uuidString) -> ProtocolWebhook.Body {
+        .protocolReady(ProtocolWebhook.makePayload(
+            job: job(id), markdown: "## Summary\nok", protocolFilename: "a.md",
+        ))
     }
 
     private func outbox(now: @escaping @Sendable () -> Date = { Date() }) -> ProtocolWebhookOutbox {
@@ -148,6 +151,38 @@ final class ProtocolWebhookOutboxTests: XCTestCase {
         XCTAssertNil(ProtocolWebhookOutbox.notice(for: report))
     }
 
+    func testQueuedTranscriptRetriesWithItsPrefixedKey() async {
+        let box = outbox()
+        let payload = ProtocolWebhook.Body.transcriptReady(ProtocolWebhook.makeTranscriptPayload(
+            job: job(), transcript: "[00:00] Anna: hi", transcriptFilename: "a.txt",
+        ))
+        await box.save(payload)
+        let calls = respond([202])
+
+        let report = await box.flush(url: endpoint, session: mockSession())
+
+        XCTAssertEqual(report.delivered, [payload.jobID])
+        XCTAssertEqual(calls(), ["transcript-\(payload.jobID)"], "the transcript event keeps its own key")
+    }
+
+    func testEntryQueuedByABuildWithoutTheTranscriptEventStillDecodes() throws {
+        // The body queued before this change was a bare protocol payload; the
+        // outbox must keep retrying it after the upgrade.
+        let protocolPayload = ProtocolWebhook.makePayload(
+            job: job(), markdown: "## Summary\nok", protocolFilename: "a.md",
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let legacy = try encoder.encode(LegacyOutboxEntry(createdAt: start, payload: protocolPayload))
+        try legacy.write(to: file(protocolPayload.jobID))
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let entry = try decoder.decode(ProtocolWebhookOutbox.Entry.self, from: Data(contentsOf: file(protocolPayload.jobID)))
+        XCTAssertEqual(entry.payload, .protocolReady(protocolPayload))
+        XCTAssertEqual(entry.createdAt, start)
+    }
+
     func testSuccessfulDeliveryAlsoSendsWhatWasQueued() async {
         let box = outbox()
         let older = payload()
@@ -178,6 +213,17 @@ final class ProtocolWebhookOutboxTests: XCTestCase {
         let entry = try decoder.decode(ProtocolWebhookOutbox.Entry.self, from: Data(contentsOf: file(queued.jobID)))
         XCTAssertEqual(entry.createdAt, start)
         XCTAssertEqual(entry.payload, queued)
+    }
+}
+
+/// The entry shape an older build wrote: a bare protocol payload.
+private struct LegacyOutboxEntry: Codable {
+    let createdAt: Date
+    let payload: ProtocolWebhook.Payload
+
+    enum CodingKeys: String, CodingKey {
+        case payload
+        case createdAt = "created_at"
     }
 }
 

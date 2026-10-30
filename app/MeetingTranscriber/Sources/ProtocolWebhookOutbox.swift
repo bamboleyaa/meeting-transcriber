@@ -3,7 +3,7 @@ import os
 
 private let logger = Logger(subsystem: AppPaths.logSubsystem, category: "ProtocolWebhookOutbox")
 
-/// Payloads the protocol webhook could not deliver, kept on disk until it can.
+/// Payloads the webhook could not deliver, kept on disk until it can.
 ///
 /// Without it a protocol whose delivery failed (offline laptop, receiver
 /// down past the in-process retries) never reached the receiver at all: the
@@ -21,7 +21,9 @@ private let logger = Logger(subsystem: AppPaths.logSubsystem, category: "Protoco
 actor ProtocolWebhookOutbox {
     struct Entry: Codable, Equatable {
         let createdAt: Date
-        let payload: ProtocolWebhook.Payload
+        /// A protocol or a transcript event; `Body` decodes both, including
+        /// entries written before the transcript event existed.
+        let payload: ProtocolWebhook.Body
 
         enum CodingKeys: String, CodingKey {
             case payload
@@ -60,9 +62,9 @@ actor ProtocolWebhookOutbox {
 
     /// Queue a payload. A job already queued keeps its original date, so a
     /// regeneration that fails too does not extend its life.
-    func save(_ payload: ProtocolWebhook.Payload) {
-        guard UUID(uuidString: payload.jobID) != nil else { return }
-        let url = fileURL(jobID: payload.jobID)
+    func save(_ body: ProtocolWebhook.Body) {
+        guard UUID(uuidString: body.jobID) != nil else { return }
+        let url = fileURL(jobID: body.jobID)
         let createdAt = load(url)?.createdAt ?? now()
         do {
             try FileManager.default.createDirectory(
@@ -70,9 +72,9 @@ actor ProtocolWebhookOutbox {
             )
             let encoder = JSONEncoder()
             encoder.dateEncodingStrategy = .iso8601
-            try encoder.encode(Entry(createdAt: createdAt, payload: payload)).write(to: url, options: .atomic)
+            try encoder.encode(Entry(createdAt: createdAt, payload: body)).write(to: url, options: .atomic)
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
-            logger.info("protocol_webhook_queued job=\(payload.jobID, privacy: .public)")
+            logger.info("webhook_queued job=\(body.jobID, privacy: .public) event=\(body.idempotencyKey, privacy: .public)")
         } catch {
             logger.error("protocol_webhook_queue_failed error=\(error.localizedDescription, privacy: .public)")
         }
@@ -122,7 +124,7 @@ actor ProtocolWebhookOutbox {
             }
             let outcome: ProtocolWebhook.Outcome
             do {
-                let request = try ProtocolWebhook.makeRequest(url: url, payload: entry.payload)
+                let request = try ProtocolWebhook.makeRequest(url: url, body: entry.payload)
                 outcome = await ProtocolWebhook.send(request, session: session, retryDelays: [])
             } catch {
                 outcome = .rejected(status: 0)
@@ -154,12 +156,12 @@ extension ProtocolWebhookOutbox {
     static func notice(for report: FlushReport) -> String? {
         var parts: [String] = []
         if !report.rejected.isEmpty {
-            parts.append("\(report.rejected.count) queued protocol(s) rejected by the webhook")
+            parts.append("\(report.rejected.count) queued webhook message(s) rejected by the webhook")
         }
         if !report.expired.isEmpty {
-            parts.append("\(report.expired.count) protocol(s) not delivered within 7 days and dropped from the retry queue")
+            parts.append("\(report.expired.count) webhook message(s) not delivered within 7 days and dropped from the retry queue")
         }
-        return parts.isEmpty ? nil : parts.joined(separator: "; ") + ". The files stay in the protocols folder."
+        return parts.isEmpty ? nil : parts.joined(separator: "; ") + ". The meeting files stay on this Mac."
     }
 
     /// Retry at launch and then every `interval` for the life of the app.
